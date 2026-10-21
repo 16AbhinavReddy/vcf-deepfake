@@ -14,15 +14,17 @@ from losses import vcf_loss
 import time
 from tqdm import tqdm
 
+from sklearn.model_selection import StratifiedGroupKFold
+
 
 SEED = 42
 NUM_FRAMES = 8
 IMAGE_SIZE = 112
-BATCH_SIZE = 1
-EPOCHS = 1
-LEARNING_RATE = 1e-4
-LAMBDA_COS = 0.1
-NUM_WORKERS = 0
+BATCH_SIZE = 2
+EPOCHS = 5
+LEARNING_RATE = 5e-5
+LAMBDA_COS = 0.2
+NUM_WORKERS = 2
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_ROOT = ROOT / "vcf" / "vcf"
@@ -39,35 +41,37 @@ def set_seed(seed):
 
 
 def make_splits(dataset):
-    """
-    Split by source group so related videos cannot cross splits.
-    Approximate proportions: 70% train, 10% validation, 20% test.
-    """
     indices = np.arange(len(dataset))
+    labels = np.array([r["label"] for r in dataset.records])
     groups = np.array([r["group_id"] for r in dataset.records])
 
-    first_split = GroupShuffleSplit(
-        n_splits=1, test_size=0.20, random_state=SEED
+    # Approximately 20% held out for testing.
+    outer = StratifiedGroupKFold(
+        n_splits=5, shuffle=True, random_state=SEED
     )
-    train_val_idx, test_idx = next(
-        first_split.split(indices, groups=groups)
+    train_val_rel, test_rel = next(
+        outer.split(indices, labels, groups)
     )
 
-    # Validation is 12.5% of the remaining 80% = 10% overall.
-    second_split = GroupShuffleSplit(
-        n_splits=1, test_size=0.125, random_state=SEED
+    train_val_idx = indices[train_val_rel]
+    test_idx = indices[test_rel]
+
+    # Approximately 10% of the complete dataset for validation:
+    # 12.5% of the remaining 80%.
+    inner = StratifiedGroupKFold(
+        n_splits=8, shuffle=True, random_state=SEED + 1
     )
     train_rel, val_rel = next(
-        second_split.split(
+        inner.split(
             train_val_idx,
-            groups=groups[train_val_idx]
+            labels[train_val_idx],
+            groups[train_val_idx],
         )
     )
 
     train_idx = train_val_idx[train_rel]
     val_idx = train_val_idx[val_rel]
 
-    # Explicitly check group separation.
     train_groups = set(groups[train_idx])
     val_groups = set(groups[val_idx])
     test_groups = set(groups[test_idx])
@@ -76,8 +80,23 @@ def make_splits(dataset):
     assert train_groups.isdisjoint(test_groups)
     assert val_groups.isdisjoint(test_groups)
 
-    return train_idx.tolist(), val_idx.tolist(), test_idx.tolist()
+    for name, idx in [
+        ("Train", train_idx),
+        ("Validation", val_idx),
+        ("Test", test_idx),
+    ]:
+        print(
+            f"{name}: {len(idx)} samples, "
+            f"real={(labels[idx] == 0).sum()}, "
+            f"fake={(labels[idx] == 1).sum()}, "
+            f"groups={len(set(groups[idx]))}"
+        )
 
+    return (
+        train_idx.tolist(),
+        val_idx.tolist(),
+        test_idx.tolist(),
+    )
 
 
 def run_epoch(model, loader, optimizer, device, scaler=None):
@@ -100,6 +119,8 @@ def run_epoch(model, loader, optimizer, device, scaler=None):
         unit="batch",
         dynamic_ncols=True,
     )
+
+    tp = tn = fp = fn = 0
 
     for batch_idx, (raw, c23, c40, labels, group_ids) in enumerate(progress):
         batch_start = time.time()
@@ -159,6 +180,14 @@ def run_epoch(model, loader, optimizer, device, scaler=None):
         correct += (predictions == labels).sum().item()
         count += labels.numel()
 
+        pred = predictions.view(-1).to(torch.int64)
+        target = labels.view(-1).to(torch.int64)
+
+        tp += ((pred == 1) & (target == 1)).sum().item()
+        tn += ((pred == 0) & (target == 0)).sum().item()
+        fp += ((pred == 1) & (target == 0)).sum().item()
+        fn += ((pred == 0) & (target == 1)).sum().item()
+
         total_loss += loss.detach().item()
         total_bce += parts["bce"].item()
         total_cos += parts["cosine"].item()
@@ -197,13 +226,29 @@ def run_epoch(model, loader, optimizer, device, scaler=None):
                 flush=True,
             )
 
+    real_recall = tn / max(tn + fp, 1)
+    fake_recall = tp / max(tp + fn, 1)
+    balanced_acc = (real_recall + fake_recall) / 2
+
+    print(
+        f"\n[{phase}] Confusion matrix counts: "
+        f"TN={tn}, FP={fp}, FN={fn}, TP={tp}"
+    )
+    print(
+        f"  Val real recall={val_metrics['real_recall']:.4f}, "
+        f"fake recall={val_metrics['fake_recall']:.4f}, "
+        f"balanced accuracy={val_metrics['balanced_accuracy']:.4f}"
+    )
+
     return {
         "loss": total_loss / max(len(loader), 1),
         "bce": total_bce / max(len(loader), 1),
         "cosine": total_cos / max(len(loader), 1),
         "accuracy": correct / max(count, 1),
+        "real_recall": real_recall,
+        "fake_recall": fake_recall,
+        "balanced_accuracy": balanced_acc,
     }
-
 
 def main():
     set_seed(SEED)
@@ -239,9 +284,10 @@ def main():
     val_loader = DataLoader(
         Subset(dataset, val_idx),
         batch_size=BATCH_SIZE,
-        shuffle=False,
+        shuffle=True,
         num_workers=NUM_WORKERS,
         pin_memory=(device.type == "cuda"),
+        generator=torch.Generator().manual_seed(SEED),
     )
 
     model = VCFDeepfakeDetector(pretrained=True).to(device)
@@ -278,7 +324,6 @@ def main():
             f"cos={val_metrics['cosine']:.4f}, "
             f"acc={val_metrics['accuracy']:.4f}"
         )
-
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
             torch.save(
