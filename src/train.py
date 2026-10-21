@@ -235,9 +235,9 @@ def run_epoch(model, loader, optimizer, device, scaler=None):
         f"TN={tn}, FP={fp}, FN={fn}, TP={tp}"
     )
     print(
-        f"  Val real recall={val_metrics['real_recall']:.4f}, "
-        f"fake recall={val_metrics['fake_recall']:.4f}, "
-        f"balanced accuracy={val_metrics['balanced_accuracy']:.4f}"
+        f"[{phase}] Real recall={real_recall:.4f}, "
+        f"Fake recall={fake_recall:.4f}, "
+        f"Balanced accuracy={balanced_acc:.4f}"
     )
 
     return {
@@ -323,6 +323,11 @@ def main():
             f"BCE={val_metrics['bce']:.4f}, "
             f"cos={val_metrics['cosine']:.4f}, "
             f"acc={val_metrics['accuracy']:.4f}"
+        )
+        print(
+            f"  Val real recall={val_metrics['real_recall']:.4f}, "
+            f"fake recall={val_metrics['fake_recall']:.4f}, "
+            f"balanced accuracy={val_metrics['balanced_accuracy']:.4f}"
         )
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
