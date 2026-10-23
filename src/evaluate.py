@@ -19,13 +19,19 @@ from model import VCFDeepfakeDetector
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECKPOINT_PATH = ROOT / "checkpoints" / "best_model.pt"
-DATA_ROOT = ROOT / "vcf" / "vcf"
+DATA_ROOT = ROOT / "vcf-balanced"
 
 
 def main():
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
+    print(f"Device: {device}")
+
+    if not CHECKPOINT_PATH.is_file():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {CHECKPOINT_PATH}"
+        )
 
     checkpoint = torch.load(
         CHECKPOINT_PATH,
@@ -40,6 +46,13 @@ def main():
     )
 
     test_indices = checkpoint["test_indices"]
+
+    if max(test_indices) >= len(dataset):
+        raise ValueError(
+            "Checkpoint test indices do not match the current dataset. "
+            "Retrain the model using vcf-balanced."
+        )
+
     test_loader = DataLoader(
         Subset(dataset, test_indices),
         batch_size=1,
@@ -54,7 +67,6 @@ def main():
 
     all_labels = []
     all_predictions = []
-    all_probabilities = []
 
     with torch.no_grad():
         for raw, c23, c40, labels, _group_ids in test_loader:
@@ -71,21 +83,25 @@ def main():
                 logits_c23, _ = model(c23)
                 logits_c40, _ = model(c40)
 
-            # Average logits, then convert to probabilities.
+            # Overall prediction: average logits across all
+            # three compression versions.
             avg_logits = (
                 logits_raw + logits_c23 + logits_c40
             ) / 3.0
 
-            probabilities = torch.sigmoid(avg_logits).cpu().numpy()
-            predictions = (probabilities >= 0.5).astype(int)
+            predictions = (
+                torch.sigmoid(avg_logits) >= 0.5
+            ).int()
 
             all_labels.extend(labels.numpy().astype(int).tolist())
-            all_predictions.extend(predictions.reshape(-1).tolist())
-            all_probabilities.extend(probabilities.reshape(-1).tolist())
+            all_predictions.extend(
+                predictions.cpu().numpy().reshape(-1).tolist()
+            )
 
     y_true = np.array(all_labels)
     y_pred = np.array(all_predictions)
 
+    print("\n===== OVERALL TEST PERFORMANCE =====")
     print(f"Checkpoint epoch: {checkpoint['epoch']}")
     print(f"Test samples: {len(y_true)}")
     print(f"Accuracy:  {accuracy_score(y_true, y_pred):.4f}")
@@ -117,4 +133,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

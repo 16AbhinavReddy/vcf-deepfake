@@ -11,6 +11,9 @@ __pycache__/
 
 # Dataset videos
 vcf/
+vcf-balanced/
+vcf-balanced.zip
+balance_data.py
 
 # Model checkpoints and weights
 checkpoints/
