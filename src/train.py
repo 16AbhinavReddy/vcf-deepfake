@@ -1,10 +1,10 @@
 from pathlib import Path
+import csv
 import random
 import time
 
 import numpy as np
 import torch
-from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
@@ -16,10 +16,10 @@ from model import VCFDeepfakeDetector
 SEED = 42
 NUM_FRAMES = 8
 IMAGE_SIZE = 112
-BATCH_SIZE = 6
+BATCH_SIZE = 4
 EPOCHS = 3
 LEARNING_RATE = 1e-4
-LAMBDA_COS = 1
+LAMBDA_COS = 0.4
 NUM_WORKERS = 2
 
 # Assumes this file is in <project-root>/src/train.py and the balanced
@@ -39,34 +39,98 @@ def set_seed(seed):
 
 
 def make_splits(dataset):
-    indices = np.arange(len(dataset))
+    """
+    Load the fixed split assignments created by src/create_splits.py.
+    Never regenerate splits during model training.
+    """
+    split_dir = ROOT / "splits"
+
+    index_by_path = {
+        record["relative_path"]: i
+        for i, record in enumerate(dataset.records)
+    }
+
+    def load_indices(split_name):
+        csv_path = split_dir / f"{split_name}.csv"
+        if not csv_path.is_file():
+            raise FileNotFoundError(
+                f"Missing {csv_path}. Run "
+                "`python src/create_splits.py` once before training."
+            )
+
+        indices = []
+        seen_paths = set()
+
+        with csv_path.open("r", newline="", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            required = {"relative_path", "label", "group_id"}
+            if not reader.fieldnames or not required.issubset(reader.fieldnames):
+                raise ValueError(
+                    f"{csv_path} must contain columns: "
+                    "relative_path,label,group_id"
+                )
+
+            for row in reader:
+                relative_path = row["relative_path"]
+
+                if relative_path in seen_paths:
+                    raise ValueError(
+                        f"Duplicate path {relative_path!r} in {csv_path}"
+                    )
+                seen_paths.add(relative_path)
+
+                if relative_path not in index_by_path:
+                    raise ValueError(
+                        f"Split record {relative_path!r} from {csv_path} "
+                        "is missing from the current dataset. "
+                        "Recreate the balanced dataset or regenerate splits "
+                        "intentionally."
+                    )
+
+                idx = index_by_path[relative_path]
+                record = dataset.records[idx]
+
+                if int(row["label"]) != int(record["label"]):
+                    raise ValueError(
+                        f"Label mismatch for {relative_path!r} in {csv_path}"
+                    )
+                if row["group_id"] != str(record["group_id"]):
+                    raise ValueError(
+                        f"Group mismatch for {relative_path!r} in {csv_path}. "
+                        "Check dataset.py source_id() and recreate splits if needed."
+                    )
+
+                indices.append(idx)
+
+        if not indices:
+            raise ValueError(f"No records found in {csv_path}")
+
+        return indices
+
+    train_idx = load_indices("train")
+    val_idx = load_indices("val")
+    test_idx = load_indices("test")
+
+    # Verify that records do not overlap.
+    assert set(train_idx).isdisjoint(val_idx)
+    assert set(train_idx).isdisjoint(test_idx)
+    assert set(val_idx).isdisjoint(test_idx)
+
+    # Verify that source groups do not overlap across splits.
+    groups = [record["group_id"] for record in dataset.records]
+    train_groups = {groups[i] for i in train_idx}
+    val_groups = {groups[i] for i in val_idx}
+    test_groups = {groups[i] for i in test_idx}
+
+    if not train_groups.isdisjoint(val_groups):
+        raise ValueError("Source-group leakage between train and validation.")
+    if not train_groups.isdisjoint(test_groups):
+        raise ValueError("Source-group leakage between train and test.")
+    if not val_groups.isdisjoint(test_groups):
+        raise ValueError("Source-group leakage between validation and test.")
+
     labels = np.array([record["label"] for record in dataset.records])
-    groups = np.array([record["group_id"] for record in dataset.records])
-
-    # First reserve approximately 20% for the final test set.
-    outer = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=SEED)
-    train_val_rel, test_rel = next(outer.split(indices, labels, groups))
-    train_val_idx = indices[train_val_rel]
-    test_idx = indices[test_rel]
-
-    # Reserve approximately 10% of the full dataset for validation.
-    inner = StratifiedGroupKFold(n_splits=8, shuffle=True, random_state=SEED + 1)
-    train_rel, val_rel = next(
-        inner.split(
-            train_val_idx,
-            labels[train_val_idx],
-            groups[train_val_idx],
-        )
-    )
-    train_idx = train_val_idx[train_rel]
-    val_idx = train_val_idx[val_rel]
-
-    train_groups = set(groups[train_idx])
-    val_groups = set(groups[val_idx])
-    test_groups = set(groups[test_idx])
-    assert train_groups.isdisjoint(val_groups)
-    assert train_groups.isdisjoint(test_groups)
-    assert val_groups.isdisjoint(test_groups)
+    total = len(dataset)
 
     for name, idx in [
         ("Train", train_idx),
@@ -76,11 +140,12 @@ def make_splits(dataset):
         n_real = int((labels[idx] == 0).sum())
         n_fake = int((labels[idx] == 1).sum())
         print(
-            f"{name}: {len(idx)} samples | real={n_real} | fake={n_fake} "
-            f"| groups={len(set(groups[idx]))}"
+            f"{name}: {len(idx)} samples ({100 * len(idx) / total:.2f}%) "
+            f"| real={n_real} | fake={n_fake} "
+            f"| groups={len(set(groups[i] for i in idx))}"
         )
 
-    return train_idx.tolist(), val_idx.tolist(), test_idx.tolist()
+    return train_idx, val_idx, test_idx
 
 
 def run_epoch(model, loader, optimizer, device, scaler=None, phase="TRAIN"):
@@ -189,6 +254,7 @@ def main():
     if device.type == "cuda":
         print("GPU:", torch.cuda.get_device_name(0))
     print("Dataset root:", DATA_ROOT)
+    print("Fixed split directory:", ROOT / "splits")
 
     dataset = VCFDataset(
         root=DATA_ROOT,
@@ -229,7 +295,7 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     best_val_loss = float("inf")
-    checkpoint_path = CHECKPOINT_DIR / "best_model.pt"
+    checkpoint_path = CHECKPOINT_DIR / "best_model_linear_fixed_split.pt"
 
     for epoch in range(1, EPOCHS + 1):
         train_metrics = run_epoch(
@@ -263,9 +329,6 @@ def main():
                     "image_size": IMAGE_SIZE,
                     "lambda_cos": LAMBDA_COS,
                     "data_root": str(DATA_ROOT),
-                    "train_indices": train_idx,
-                    "val_indices": val_idx,
-                    "test_indices": test_idx,
                 },
                 checkpoint_path,
             )
@@ -279,3 +342,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

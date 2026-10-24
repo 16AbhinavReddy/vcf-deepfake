@@ -1,5 +1,6 @@
 
 from pathlib import Path
+import csv
 
 import numpy as np
 import torch
@@ -18,7 +19,7 @@ from model import VCFDeepfakeDetector
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CHECKPOINT_PATH = ROOT / "checkpoints" / "best_model.pt"
+CHECKPOINT_PATH = ROOT / "checkpoints" / "best_model_linear_fixed_split.pt"
 DATA_ROOT = ROOT / "vcf-balanced"
 
 
@@ -27,6 +28,8 @@ def main():
         "cuda" if torch.cuda.is_available() else "cpu"
     )
     print(f"Device: {device}")
+    print(f"Checkpoint: {CHECKPOINT_PATH}")
+    print(f"Dataset root: {DATA_ROOT}")
 
     if not CHECKPOINT_PATH.is_file():
         raise FileNotFoundError(
@@ -45,13 +48,59 @@ def main():
         image_size=checkpoint["image_size"],
     )
 
-    test_indices = checkpoint["test_indices"]
-
-    if max(test_indices) >= len(dataset):
-        raise ValueError(
-            "Checkpoint test indices do not match the current dataset. "
-            "Retrain the model using vcf-balanced."
+    # Always evaluate on the persisted test split, not indices generated
+    # during a training run.
+    split_file = ROOT / "splits" / "test.csv"
+    if not split_file.is_file():
+        raise FileNotFoundError(
+            f"Test split not found: {split_file}. "
+            "Run `python src/create_splits.py` once and train using the saved splits."
         )
+
+    index_by_path = {
+        record["relative_path"]: i
+        for i, record in enumerate(dataset.records)
+    }
+
+    test_indices = []
+    seen_paths = set()
+
+    with split_file.open("r", newline="", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        required = {"relative_path", "label", "group_id"}
+        if not reader.fieldnames or not required.issubset(reader.fieldnames):
+            raise ValueError(
+                f"{split_file} must contain columns: "
+                "relative_path,label,group_id"
+            )
+
+        for row in reader:
+            relative_path = row["relative_path"]
+
+            if relative_path in seen_paths:
+                raise ValueError(
+                    f"Duplicate path {relative_path!r} in {split_file}"
+                )
+            seen_paths.add(relative_path)
+
+            if relative_path not in index_by_path:
+                raise ValueError(
+                    f"Test record {relative_path!r} is missing from the "
+                    "current dataset. Check vcf-balanced and the saved split CSV."
+                )
+
+            idx = index_by_path[relative_path]
+            record = dataset.records[idx]
+
+            if int(row["label"]) != int(record["label"]):
+                raise ValueError(f"Label mismatch for {relative_path!r}")
+            if row["group_id"] != str(record["group_id"]):
+                raise ValueError(f"Group mismatch for {relative_path!r}")
+
+            test_indices.append(idx)
+
+    if not test_indices:
+        raise ValueError(f"No test records found in {split_file}")
 
     test_loader = DataLoader(
         Subset(dataset, test_indices),
@@ -133,3 +182,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

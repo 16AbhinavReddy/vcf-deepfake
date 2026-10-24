@@ -43,3 +43,4 @@ def vcf_loss(
         "bce": loss_bce.detach(),
         "cosine": loss_cos.detach(),
     }
+

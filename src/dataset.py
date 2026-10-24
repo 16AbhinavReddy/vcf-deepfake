@@ -158,3 +158,4 @@ class VCFDataset(Dataset):
         c40_video = read_video(record["paths"]["c40"], self.num_frames, self.image_size)
         label = torch.tensor(record["label"], dtype=torch.float32)
         return raw_video, c23_video, c40_video, label, record["group_id"]
+
