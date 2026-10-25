@@ -17,9 +17,9 @@ SEED = 42
 NUM_FRAMES = 8
 IMAGE_SIZE = 112
 BATCH_SIZE = 4
-EPOCHS = 3
-LEARNING_RATE = 1e-4
-LAMBDA_COS = 0.4
+EPOCHS = 5
+LEARNING_RATE = 5e-5
+LAMBDA_PRED = 0.4
 NUM_WORKERS = 2
 
 # Assumes this file is in <project-root>/src/train.py and the balanced
@@ -152,7 +152,7 @@ def run_epoch(model, loader, optimizer, device, scaler=None, phase="TRAIN"):
     training = optimizer is not None
     model.train(training)
 
-    total_loss = total_bce = total_cos = 0.0
+    total_loss = total_bce = total_pred = 0.0
     correct = count = 0
     tp = tn = fp = fn = 0
     start_time = time.time()
@@ -182,7 +182,7 @@ def run_epoch(model, loader, optimizer, device, scaler=None, phase="TRAIN"):
                 loss, parts = vcf_loss(
                     logits_raw, logits_c23, logits_c40,
                     features_raw, features_c23, features_c40,
-                    labels, lambda_cos=LAMBDA_COS,
+                    labels, lambda_pred=LAMBDA_PRED,
                 )
 
             if training:
@@ -210,7 +210,7 @@ def run_epoch(model, loader, optimizer, device, scaler=None, phase="TRAIN"):
 
         total_loss += float(loss.detach().item())
         total_bce += float(parts["bce"].item())
-        total_cos += float(parts["cosine"].item())
+        total_pred += float(parts["pred_consistency"].item())
 
         elapsed = time.time() - batch_start
         batch_times.append(elapsed)
@@ -220,7 +220,7 @@ def run_epoch(model, loader, optimizer, device, scaler=None, phase="TRAIN"):
         progress.set_postfix(
             loss=f"{total_loss / (batch_idx + 1):.4f}",
             bce=f"{total_bce / (batch_idx + 1):.4f}",
-            cos=f"{total_cos / (batch_idx + 1):.4f}",
+            pred_cons=f"{total_pred / (batch_idx + 1):.4f}",
             acc=f"{correct / max(count, 1):.3f}",
             batch_s=f"{elapsed:.1f}",
             eta=f"{eta_seconds / 60:.1f}m",
@@ -239,7 +239,7 @@ def run_epoch(model, loader, optimizer, device, scaler=None, phase="TRAIN"):
     return {
         "loss": total_loss / max(len(loader), 1),
         "bce": total_bce / max(len(loader), 1),
-        "cosine": total_cos / max(len(loader), 1),
+        "pred_consistency": total_pred / max(len(loader), 1),
         "accuracy": correct / max(count, 1),
         "real_recall": real_recall,
         "fake_recall": fake_recall,
@@ -295,7 +295,7 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     best_val_loss = float("inf")
-    checkpoint_path = CHECKPOINT_DIR / "best_model_linear_fixed_split.pt"
+    checkpoint_path = CHECKPOINT_DIR / "best_model_linear_prediction_consistency_fixed_split.pt"
 
     for epoch in range(1, EPOCHS + 1):
         train_metrics = run_epoch(
@@ -309,10 +309,10 @@ def main():
         print(
             f"\nEpoch {epoch}/{EPOCHS}\n"
             f"  Train: loss={train_metrics['loss']:.4f}, "
-            f"BCE={train_metrics['bce']:.4f}, cos={train_metrics['cosine']:.4f}, "
+            f"BCE={train_metrics['bce']:.4f}, pred_cons={train_metrics['pred_consistency']:.4f}, "
             f"acc={train_metrics['accuracy']:.4f}\n"
             f"  Val:   loss={val_metrics['loss']:.4f}, "
-            f"BCE={val_metrics['bce']:.4f}, cos={val_metrics['cosine']:.4f}, "
+            f"BCE={val_metrics['bce']:.4f}, pred_cons={val_metrics['pred_consistency']:.4f}, "
             f"acc={val_metrics['accuracy']:.4f}\n"
             f"  Val balanced accuracy={val_metrics['balanced_accuracy']:.4f}"
         )
@@ -327,7 +327,7 @@ def main():
                     "seed": SEED,
                     "num_frames": NUM_FRAMES,
                     "image_size": IMAGE_SIZE,
-                    "lambda_cos": LAMBDA_COS,
+                    "lambda_pred": LAMBDA_PRED,
                     "data_root": str(DATA_ROOT),
                 },
                 checkpoint_path,
@@ -342,4 +342,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
