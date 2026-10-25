@@ -19,7 +19,7 @@ from model import VCFDeepfakeDetector
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CHECKPOINT_PATH = ROOT / "checkpoints" / "best_model_linear_fixed_split.pt"
+CHECKPOINT_PATH = ROOT / "checkpoints" / "best_model_linear_prediction_consistency_fixed_split.pt"
 DATA_ROOT = ROOT / "vcf-balanced"
 
 
@@ -182,4 +182,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
